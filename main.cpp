@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <format>
 #include <functional>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -49,7 +51,7 @@ static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
 static std::unordered_set<uintptr_t> g_scalarAlphaCorrectionTextures;
 static std::unordered_set<uintptr_t> g_alphaCorrectionTextures;
-static std::unordered_map<Render::ShaderFeatureFlags, SP<CShader>> g_alphaCorrectionSurfaceShaders;
+static std::map<Render::SShaderVariant, SP<CShader>> g_alphaCorrectionSurfaceShaders;
 static bool           g_correctSurfaceAlphaShader = false;
 static std::unordered_map<uintptr_t, CTimer> g_surfaceDebugTimers;
 static constexpr const char*                 SURFACE_DEBUG_LOG = "/tmp/fix-hdr-screenshare-alpha.log";
@@ -101,12 +103,12 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 }
 
 typedef bool (*origNeedsUnmodifiedCopy)(void*);
-typedef void (*origSaveBufferForMirror)(void*, const CBox&);
+typedef bool (*origSaveBufferForMirror)(void*, const CBox&);
 typedef SP<Render::IRenderbuffer> (*origGetOrCreateRenderbuffer)(void*, SP<Aquamarine::IBuffer>, uint32_t);
-typedef SP<Render::ITexture> (*origBlurFramebuffer)(void*, SP<Render::IFramebuffer>, float, CRegion*);
+typedef SP<Render::IFramebuffer> (*origBlurFramebuffer)(void*, SP<Render::IFramebuffer>, float, const CRegion&, const Render::SBlurContext&);
 typedef void (*origRenderTextureInternal)(void*, SP<Render::ITexture>, const CBox&, const Render::GL::CHyprOpenGLImpl::STextureRenderData&);
 typedef void (*origPreDrawSurface)(void*, WP<CSurfacePassElement>, const CRegion&);
-typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, Render::ShaderFeatureFlags);
+typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, const Render::SShaderVariant&);
 typedef void (*origEnsureVRR)(void*, PHLMONITOR);
 
 static constexpr float HDR_ALPHA_CORRECTION_EXPONENT      = 1.5F;
@@ -268,7 +270,7 @@ static NColorManagement::PImageDescription captureImageDescription() {
 }
 
 static bool ensureCaptureShader();
-static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, CRegion* originalDamage);
+static SP<Render::IFramebuffer> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, const CRegion& originalDamage);
 
 static bool currentMonitorInHDR() {
     const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
@@ -299,15 +301,16 @@ static void appendSurfaceDebugLog(const std::string& line) {
     std::fclose(file);
 }
 
-static SP<Render::ITexture> hkBlurFramebuffer(void* thisptr, SP<Render::IFramebuffer> source, float a, CRegion* originalDamage) {
-    auto tex = currentMonitorInHDR() ? renderSDRBlurFromHDRSource(source, a, originalDamage) : nullptr;
-    if (!tex)
-        tex = ((origBlurFramebuffer)g_blurFramebufferHook->m_original)(thisptr, source, a, originalDamage);
+static SP<Render::IFramebuffer> hkBlurFramebuffer(void* thisptr, SP<Render::IFramebuffer> source, float a, const CRegion& originalDamage,
+                                                  const Render::SBlurContext& context) {
+    auto framebuffer = currentMonitorInHDR() ? renderSDRBlurFromHDRSource(source, a, originalDamage) : nullptr;
+    if (!framebuffer)
+        framebuffer = ((origBlurFramebuffer)g_blurFramebufferHook->m_original)(thisptr, source, a, originalDamage, context);
 
-    if (currentMonitorInHDR() && tex)
-        g_srgbBlurTextures.emplace(reinterpret_cast<uintptr_t>(tex.get()));
+    if (currentMonitorInHDR() && framebuffer && framebuffer->getTexture())
+        g_srgbBlurTextures.emplace(reinterpret_cast<uintptr_t>(framebuffer->getTexture().get()));
 
-    return tex;
+    return framebuffer;
 }
 
 static void hkPreDrawSurface(void* thisptr, WP<CSurfacePassElement> element, const CRegion& damage) {
@@ -331,8 +334,8 @@ static void hkPreDrawSurface(void* thisptr, WP<CSurfacePassElement> element, con
         if (timer.getSeconds() >= 1.0) {
             timer.reset();
             const auto window = element->m_data.pWindow;
-            const auto cls    = window ? window->m_class : std::string{"<no-window>"};
-            const auto title  = window ? window->m_title : std::string{"<no-title>"};
+            const auto cls    = window ? window->metadata().appID() : std::string{"<no-window>"};
+            const auto title  = window ? window->metadata().title() : std::string{"<no-title>"};
 
             appendSurfaceDebugLog(std::format(
                 "class='{}' title='{}' alpha={} fade={} alphaModifier={} overallOpacity={} total={} corrected={} texType={} texOpaque={} surface={:x}",
@@ -359,21 +362,23 @@ static void hkPreDrawSurface(void* thisptr, WP<CSurfacePassElement> element, con
         g_scalarAlphaCorrectionTextures.erase(scalarTextureKey);
 }
 
-static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentShader frag, Render::ShaderFeatureFlags features) {
+static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentShader frag, const Render::SShaderVariant& variant) {
+    const auto features = variant.features;
+
     if (!g_correctSurfaceAlphaShader || frag != Render::SH_FRAG_SURFACE || !(features & Render::SH_FEAT_RGBA) || !Render::g_pShaderLoader ||
         !Render::GL::g_pHyprOpenGL || !Render::GL::g_pHyprOpenGL->m_shaders) {
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
     }
 
-    if (auto it = g_alphaCorrectionSurfaceShaders.find(features); it != g_alphaCorrectionSurfaceShaders.end())
+    if (auto it = g_alphaCorrectionSurfaceShaders.find(variant); it != g_alphaCorrectionSurfaceShaders.end())
         return it->second;
 
-    auto source = Render::g_pShaderLoader->getVariantSource(frag, features);
+    auto source = Render::g_pShaderLoader->getVariantSource(frag, variant);
 
     static constexpr std::string_view NEEDLE = "vec4 pixColor = texture(tex, v_texcoord);";
     const auto                        pos    = source.find(NEEDLE);
     if (pos == std::string::npos)
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
 
     const auto replacement = std::format(R"SHADER(vec4 pixColor = texture(tex, v_texcoord);
     if (pixColor.a > 0.0 && pixColor.a < 1.0)
@@ -383,9 +388,9 @@ static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentSh
 
     auto shader = makeShared<CShader>();
     if (!shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, source, true, true))
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, features);
+        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
 
-    g_alphaCorrectionSurfaceShaders.emplace(features, shader);
+    g_alphaCorrectionSurfaceShaders.emplace(variant, shader);
     return shader;
 }
 
@@ -603,8 +608,8 @@ static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
     return true;
 }
 
-static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, CRegion* originalDamage) {
-    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !source || !source->getTexture() || !originalDamage)
+static SP<Render::IFramebuffer> renderSDRBlurFromHDRSource(const SP<Render::IFramebuffer>& source, float a, const CRegion& originalDamage) {
+    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !source || !source->getTexture())
         return nullptr;
 
     const auto monitor = currentMonitor();
@@ -633,7 +638,7 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
     const auto glMatrix   = g_pHyprRenderer->projectBoxToTarget(monitorBox, TRANSFORM);
 
     const auto blurPasses = std::clamp(*PBLURPASSES, sc<int64_t>(1), sc<int64_t>(8));
-    CRegion   damage{*originalDamage};
+    CRegion   damage{originalDamage};
     damage.transform(TRANSFORM, monitor->m_transformedSize.x, monitor->m_transformedSize.y);
     damage.expand(std::clamp(*PBLURSIZE, sc<int64_t>(1), sc<int64_t>(40)) * std::pow(2, blurPasses));
 
@@ -737,26 +742,25 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
     currentTex->unbind();
     Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
 
-    return currentRenderToFB->getTexture();
+    return currentRenderToFB;
 }
 
-static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
+static bool hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     const auto monitorRef = g_pHyprRenderer ? g_pHyprRenderer->m_renderData.pMonitor : PHLMONITORREF{};
     const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
 
     if (!monitor || !monitor->inHDR()) {
-        ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
-        return;
+        return ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, box);
     }
 
     const auto resources = monitor->resources();
     if (!resources || !g_pHyprRenderer || !g_pHyprRenderer->m_renderData.currentFB)
-        return;
+        return false;
 
     const auto sourceTex = resources->m_mirrorTex ? resources->m_mirrorTex : g_pHyprRenderer->m_renderData.currentFB->getTexture();
     const auto mirrorFB  = resources->mirrorFB();
     if (!sourceTex || !mirrorFB)
-        return;
+        return false;
 
     if (mirrorFB)
         mirrorFB->setImageDescription(captureImageDescription());
@@ -766,8 +770,7 @@ static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     const float inverseSdrBrightness = monitor && monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
     const float inverseSdrSaturation = monitor && monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
 
-    if (renderCaptureShader(sourceTex, mirrorFB, box, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation))
-        return;
+    return renderCaptureShader(sourceTex, mirrorFB, box, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation);
 }
 
 static void* findFnOrThrow(const std::string& name, std::initializer_list<std::string_view> demangledNeedles) {
@@ -849,7 +852,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_getShaderVariantHook = HyprlandAPI::createFunctionHook(
         g_pluginHandle,
-        findFnOrThrow("getShaderVariant", {"CHyprOpenGLImpl::getShaderVariant("}),
+        findFnOrThrow("getShaderVariant", {"CHyprOpenGLImpl::getShaderVariant(Render::ePreparedFragmentShader, Render::SShaderVariant const&)"}),
         (void*)hkGetShaderVariant);
 
     if (!g_getShaderVariantHook || !g_getShaderVariantHook->hook())
@@ -873,7 +876,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     scheduleRefreshForAllMonitors();
 
-    return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.4"};
+    return {"fix-hdr-screenshare", "Disable the HDR unmodified-copy MRT path used for screenshare", "daniel", "0.5"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
