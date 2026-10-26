@@ -1,1 +1,5 @@
-fix-hdr-screenshare.so
+*.so
+*.so.new
+__pycache__/
+/local/
+/build/

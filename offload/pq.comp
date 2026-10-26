@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D sourceImage;
+layout(binding = 1, rgb10_a2) uniform writeonly image2D outputImage;
+layout(push_constant) uniform Conversion {
+    vec4 column0;
+    vec4 column1;
+    vec4 column2;
+    vec4 ranges;
+} conversion;
+void main() {
+    // The padding component selects a row offset for pipelined transfers.
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy) + ivec2(0, int(conversion.column2.w));
+    ivec2 extent = imageSize(outputImage);
+    // Padding components carry the valid rectangle inside persistent output
+    // capacity. Zero preserves compatibility with older diagnostic workers.
+    if (conversion.column0.w > 0.0 && conversion.column1.w > 0.0)
+        extent = min(extent, ivec2(conversion.column0.w, conversion.column1.w));
+    if (any(greaterThanEqual(p, extent))) return;
+    vec3 c = texelFetch(sourceImage, p, 0).rgb;
+    c = mat3(conversion.column0.rgb, conversion.column1.rgb, conversion.column2.rgb) * c;
+    c = (c * conversion.ranges.y + conversion.ranges.x - conversion.ranges.z) / conversion.ranges.w;
+    vec3 e = pow(clamp(c, 0.0, 1.0), vec3(2610.0 / 16384.0));
+    c = pow((3424.0 / 4096.0 + (2413.0 / 128.0) * e) / (1.0 + (2392.0 / 128.0) * e), vec3(2523.0 / 32.0));
+    imageStore(outputImage, p, vec4(c, 1.0));
+}

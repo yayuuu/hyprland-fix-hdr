@@ -1,18 +1,12 @@
 [repository]
-name = "hyprland-fix-hdr-screenshare"
+name = "hyprland-fix-hdr"
 authors = ["daniel"]
-commit_pins = [
-    # Hyprland                                  hyprland-fix-hdr-screenshare
-    ["af923e30d1d24f1f4a4f5cb8308065173c1d9539", "db870de405f9deee8b778271745ca4674c852ae1"], # v0.55.0
-]
 
 [hyprland]
-plugins = ["fix-hdr-screenshare"]
+plugins = ["hyprland-fix-hdr"]
 
-[fix-hdr-screenshare]
-description = "Disable the HDR unmodified-copy MRT path used for screenshare"
+[hyprland-fix-hdr]
+description = "HDR capture/color fixes, optional NVIDIA offload and capture/VRR synchronization"
 authors = ["daniel"]
-output = "fix-hdr-screenshare.so"
-build = [
-    "make",
-]
+output = "hyprland-fix-hdr.so"
+build = ["make"]
