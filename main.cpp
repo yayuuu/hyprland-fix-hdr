@@ -37,7 +37,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         cleanup();
         throw;
     }
-    return {"hyprland-fix-hdr", "HDR color/capture fixes, demand-driven NVIDIA offload and capture/VRR synchronization", "daniel", HDRFix::VERSION};
+    return {"hyprland-fix-hdr", "HDR color/capture fixes and capture/VRR synchronization", "daniel", HDRFix::VERSION};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
