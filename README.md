@@ -28,6 +28,18 @@ monitor draw. Screensharing, mirrors and capture rendering keep the original
 scalar and per-pixel alpha. Fully transparent and opaque endpoints are preserved,
 and isolated SDR scenes are excluded.
 
+## Install with hyprpm
+
+```sh
+hyprpm add https://github.com/yayuuu/hyprland-fix-hdr.git
+hyprpm enable hyprland-fix-hdr
+hyprpm reload
+```
+
+Run `hyprpm reload` when your Hyprland session starts. Do not also load a
+manually built copy of this plugin. Hyprpm builds against headers matching the
+running compositor and manages the installed library.
+
 ## Build
 
 Install a C++23 compiler, Make, pkg-config and matching development packages for
