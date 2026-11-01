@@ -1,7 +1,6 @@
 # hyprland-fix-hdr
 
 HDR rendering, color, blur and screen-capture corrections for stock Hyprland.
-Version **0.7.0** targets Hyprland **0.56.2** (`efb50993780079460b0cbed1363e2166a2de1d9f`) and Aquamarine **0.15.x**.
 
 ## What it does
 
@@ -65,4 +64,4 @@ The shared object no longer embeds a Vulkan worker or requires shader compilatio
 hyprctl hdrfix status
 ```
 
-The status reports the loaded version and installed color corrections. Rendering and recording optimization controls are provided by GPU-switch.
+The status reports the installed color corrections. Rendering and recording optimization controls are provided by GPU-switch.

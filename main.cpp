@@ -1,12 +1,12 @@
 #include "modules.hpp"
 #include <stdexcept>
 #include <sstream>
-#include <hyprland/src/debug/HyprCtl.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 
 namespace {
     bool screenshareStarted = false;
     HANDLE pluginHandle=nullptr;
-    SP<SHyprCtlCommand> statusCommand;
+    SP<IPC::Socket1::SCommand> statusCommand;
 
     void cleanup() {
         if(statusCommand){HyprlandAPI::unregisterHyprCtlCommand(pluginHandle,statusCommand);statusCommand.reset();}
@@ -31,8 +31,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         // Mark before init so partially installed hooks/timers are cleaned too.
         screenshareStarted = true;
         HDRFix::initScreenshare(handle);
-        statusCommand=HyprlandAPI::registerHyprCtlCommand(handle,{.name="hdrfix",.exact=false,.fn=[](eHyprCtlOutputFormat,std::string request){
-            std::istringstream words(request);std::string name,action;words>>name>>action;
+        statusCommand=HyprlandAPI::registerHyprCtlCommand(handle,{.name="hdrfix",.match=IPC::Socket1::COMMAND_MATCH_PREFIX,.handler=[](const IPC::Socket1::SRequest& request) -> IPC::Socket1::SResponse {
+            std::istringstream words(request.command);std::string name,action;words>>name>>action;
             if(!action.empty() && action!="status")return std::string("error: use hdrfix status");
             return std::string("{\"version\":\"")+HDRFix::VERSION+"\",\"color_fixes\":true,\"alpha_fixes\":true,\"blur_fixes\":true,\"capture_color_fixes\":true}";
         }});

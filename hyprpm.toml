@@ -1,6 +1,10 @@
 [repository]
 name = "hyprland-fix-hdr"
 authors = ["daniel"]
+commit_pins = [
+    # Hyprland                                  hyprland-fix-hdr
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "042bae3a8f52c0868ad591126eccf6569d0b01f7"], # v0.56.2
+]
 
 [hyprland]
 plugins = ["hyprland-fix-hdr"]
