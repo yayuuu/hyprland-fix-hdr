@@ -1,862 +1,307 @@
-#define WLR_USE_UNSTABLE
+#include "../modules.hpp"
+#include "capture-shader.hpp"
 
 #include <algorithm>
-#include <any>
-#include <array>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <format>
-#include <functional>
 #include <map>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
-
-#define private public
-#include <aquamarine/backend/DRM.hpp>
-#undef private
-#include <aquamarine/buffer/Buffer.hpp>
-#include <hyprland/src/config/shared/monitor/MonitorRuleManager.hpp>
-#include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
-#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
-#include <hyprland/src/output/Monitor.hpp>
-#include <hyprland/src/plugins/PluginAPI.hpp>
-#include "../modules.hpp"
-#include <hyprland/src/render/Renderbuffer.hpp>
-#include <hyprland/src/render/GLRenderer.hpp>
+#include <hyprland/src/protocols/ColorManagement.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprutils/utils/ScopeGuard.hpp>
 
-#ifndef FIX_HDR_AQUAMARINE_VERSION
-#error "Build with make so the Aquamarine development version is checked"
-#endif
+using namespace NColorManagement;
+using namespace Render;
+using Hyprutils::Utils::CScopeGuard;
+using TextureData = GL::CHyprOpenGLImpl::STextureRenderData;
 
-// Hyprland's version.h describes its build, not the headers selected by pkg-config.
-// Checking only the plugin API hash therefore misses stale Aquamarine headers.
-static constexpr std::string_view libraryAbiVersion(std::string_view version) {
-    return version.substr(0, version.rfind('.'));
+namespace {
+HANDLE pluginHandle = nullptr;
+CFunctionHook *getTextureHook = nullptr, *renderToFBHook = nullptr, *renderTextureHook = nullptr, *preDrawSurfaceHook = nullptr, *getShaderHook = nullptr;
+
+struct SDRCopy {
+    WP<ITexture> source, copy;
+};
+std::unordered_map<ITexture*, SDRCopy> sdrCopies;
+std::unordered_set<ITexture*> scalarAlphaTextures, pixelAlphaTextures;
+bool correctPixelAlpha = false, correctScalarAlpha = false;
+
+enum class Capture { NONE, MIRROR, PRIMARY };
+struct Source {
+    PImageDescription description;
+    SP<ITexture> copy;
+    bool displayAdjusted = false;
+};
+struct Draw {
+    CRenderContext& ctx;
+    Source source, blur;
+    Capture capture = Capture::NONE;
+    bool captureSource = false, captureBlur = false;
+};
+Draw* currentDraw = nullptr;
+struct ShaderKey {
+    SShaderVariant variant;
+    Capture capture;
+    bool alpha, scalar, source, blur;
+    auto operator<=>(const ShaderKey&) const = default;
+};
+std::map<ShaderKey, SP<CShader>> shaders;
+uint64_t copyDraws = 0, tonemapDraws = 0, shaderFailures = 0;
+
+bool isHDR(PImageDescription description) {
+    if (!description)
+        return false;
+    const auto tf = description->value().transferFunction;
+    return tf == CM_TRANSFER_FUNCTION_LINEAR || tf == CM_TRANSFER_FUNCTION_EXT_LINEAR || tf == CM_TRANSFER_FUNCTION_ST2084_PQ || tf == CM_TRANSFER_FUNCTION_HLG;
 }
 
-static_assert(libraryAbiVersion(FIX_HDR_AQUAMARINE_VERSION) == libraryAbiVersion(AQUAMARINE_VERSION),
-              "Aquamarine development files do not match Hyprland's ABI; remove stale headers/pkg-config files and rebuild");
-
-extern "C" {
-#include <xf86drm.h>
-#include <xf86drmMode.h>
+bool hdrTarget(CRenderContext& ctx) {
+    return ctx.m_mode == RENDER_MODE_NORMAL && !ctx.m_renderingCapture && ctx.m_data.pMonitor && ctx.m_data.pMonitor->inHDR() &&
+        ctx.m_data.currentFB && isHDR(ctx.m_data.currentFB->imageDescription());
 }
 
-static HANDLE         g_pluginHandle             = nullptr;
-static CFunctionHook* g_needsUnmodifiedCopyHook  = nullptr;
-static CFunctionHook* g_saveBufferForMirrorHook  = nullptr;
-static CFunctionHook* g_getOrCreateRBHook        = nullptr;
-static CFunctionHook* g_blurFramebufferHook      = nullptr;
-static CFunctionHook* g_renderTextureHook        = nullptr;
-static CFunctionHook* g_preDrawSurfaceHook       = nullptr;
-static CFunctionHook* g_getShaderVariantHook     = nullptr;
-static bool           g_disableUnmodifiedCopyMRT = true;
-static SP<CShader>     g_captureShader;
-static std::unordered_set<uintptr_t> g_scalarAlphaCorrectionTextures;
-static std::unordered_set<uintptr_t> g_alphaCorrectionTextures;
-static std::map<Render::SShaderVariant, SP<CShader>> g_alphaCorrectionSurfaceShaders;
-static bool           g_correctSurfaceAlphaShader = false;
-static std::unordered_map<uintptr_t, CTimer> g_surfaceDebugTimers;
-static constexpr const char*                 SURFACE_DEBUG_LOG = "/tmp/hyprland-fix-hdr-alpha.log";
-
-struct SDMABUFImportKey {
-    uintptr_t               buffer = 0;
-    int                     width = 0;
-    int                     height = 0;
-    uint32_t                format = 0;
-    uint64_t                modifier = 0;
-    int                     planes = 0;
-    std::array<uint32_t, 4> offsets = {0};
-    std::array<uint32_t, 4> strides = {0};
-    std::array<int, 4>      fds = {-1, -1, -1, -1};
-
-    bool operator==(const SDMABUFImportKey& other) const = default;
-};
-
-struct SDMABUFImportKeyHash {
-    size_t operator()(const SDMABUFImportKey& key) const {
-        size_t seed = 0;
-        auto   combine = [&](const auto value) {
-            seed ^= std::hash<std::decay_t<decltype(value)>>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-        };
-
-        combine(key.buffer);
-        combine(key.width);
-        combine(key.height);
-        combine(key.format);
-        combine(key.modifier);
-        combine(key.planes);
-
-        for (int i = 0; i < key.planes; ++i) {
-            combine(key.offsets[i]);
-            combine(key.strides[i]);
-            combine(key.fds[i]);
-        }
-
-        return seed;
-    }
-};
-
-static std::unordered_set<SDMABUFImportKey, SDMABUFImportKeyHash> g_importableDMABUFs;
-static constexpr size_t                                          MAX_IMPORT_CACHE_SIZE = 512;
-static std::unordered_set<uintptr_t>                             g_srgbBlurTextures;
-
-
-typedef bool (*origNeedsUnmodifiedCopy)(void*);
-typedef bool (*origSaveBufferForMirror)(void*, Render::CRenderContext&, const CBox&);
-static_assert(std::is_same_v<decltype(&Render::GL::CHyprOpenGLImpl::saveBufferForMirror),
-    bool (Render::GL::CHyprOpenGLImpl::*)(Render::CRenderContext&, const CBox&)>);
-typedef SP<Render::IRenderbuffer> (*origGetOrCreateRenderbuffer)(void*, SP<Aquamarine::IBuffer>, uint32_t);
-typedef SP<Render::IFramebuffer> (*origBlurFramebuffer)(void*, Render::CRenderContext&, SP<Render::IFramebuffer>, float, const CRegion&, const Render::SBlurContext&);
-static_assert(std::is_same_v<decltype(&Render::GL::CHyprGLRenderer::blurFramebuffer),
-    SP<Render::IFramebuffer> (Render::GL::CHyprGLRenderer::*)(Render::CRenderContext&, SP<Render::IFramebuffer>, float, const CRegion&, const Render::SBlurContext&)>);
-typedef void (*origRenderTextureInternal)(void*, Render::CRenderContext&, SP<Render::ITexture>, const CBox&, const Render::GL::CHyprOpenGLImpl::STextureRenderData&);
-typedef void (*origPreDrawSurface)(void*, Render::CRenderContext&, WP<CSurfacePassElement>, const CRegion&);
-typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, const Render::SShaderVariant&);
-
-static constexpr float HDR_ALPHA_CORRECTION_EXPONENT      = 1.5F;
-
-static void scheduleRefreshForAllMonitors() {
-    if (!g_pCompositor)
-        return;
-
+void refreshMonitors() {
     if (!State::monitorState())
         return;
-
     for (const auto& monitor : State::monitorState()->monitors()) {
         if (!monitor)
             continue;
-
-        monitor->m_forceFullFrames = std::max(monitor->m_forceFullFrames, 1);
+        monitor->m_blurFBDirty = true;
+        monitor->m_forceFullFrames = std::max(monitor->m_forceFullFrames, 2);
+        if (const auto resources = monitor->resources())
+            resources->invalidateMirrorFB();
         monitor->scheduleFrame(Aquamarine::IOutput::AQ_SCHEDULE_RENDER_MONITOR);
     }
 }
 
-static bool hkNeedsUnmodifiedCopy(void* thisptr) {
-    const auto monitor = static_cast<Monitor::CMonitor*>(thisptr);
-
-    if (g_disableUnmodifiedCopyMRT && monitor && monitor->inHDR())
-        return false;
-
-    return ((origNeedsUnmodifiedCopy)g_needsUnmodifiedCopyHook->m_original)(thisptr);
+// Remember native framebuffer/MRT pairs without keeping either texture alive.
+SP<ITexture> hkGetTexture(IFramebuffer* framebuffer) {
+    auto source = reinterpret_cast<SP<ITexture> (*)(IFramebuffer*)>(getTextureHook->m_original)(framebuffer);
+    if (!source)
+        return source;
+    const auto copy = framebuffer->getMirrorTexture();
+    if (copy && copy != source && copy->m_imageDescription && !isHDR(copy->m_imageDescription)) {
+        if (!sdrCopies.contains(source.get()) && sdrCopies.size() >= 64)
+            std::erase_if(sdrCopies, [](const auto& item) { return item.second.source.expired() || item.second.copy.expired(); });
+        sdrCopies[source.get()] = {source, copy};
+    } else
+        sdrCopies.erase(source.get());
+    return source;
 }
 
-static bool canImportDMABUFForRenderbuffer(const SP<Aquamarine::IBuffer>& buffer) {
-    if (!buffer || !Render::GL::g_pHyprOpenGL)
-        return false;
-
-    const auto attrs = buffer->dmabuf();
-    if (!attrs.success || attrs.size.x <= 0 || attrs.size.y <= 0 || attrs.format == 0 || attrs.planes < 1 || attrs.planes > 4)
-        return false;
-
-    for (int i = 0; i < attrs.planes; ++i) {
-        if (attrs.fds[i] < 0 || attrs.strides[i] == 0)
-            return false;
-    }
-
-    const SDMABUFImportKey key = {
-        .buffer   = reinterpret_cast<uintptr_t>(buffer.get()),
-        .width    = static_cast<int>(attrs.size.x),
-        .height   = static_cast<int>(attrs.size.y),
-        .format   = attrs.format,
-        .modifier = attrs.modifier,
-        .planes   = attrs.planes,
-        .offsets  = attrs.offsets,
-        .strides  = attrs.strides,
-        .fds      = attrs.fds,
-    };
-
-    if (g_importableDMABUFs.contains(key))
-        return true;
-
-    const auto image = Render::GL::g_pHyprOpenGL->createEGLImage(attrs);
-    if (image == EGL_NO_IMAGE_KHR)
-        return false;
-
-    Render::GL::g_pHyprOpenGL->m_proc.eglDestroyImageKHR(Render::GL::g_pHyprOpenGL->m_eglDisplay, image);
-
-    if (g_importableDMABUFs.size() >= MAX_IMPORT_CACHE_SIZE)
-        g_importableDMABUFs.clear();
-
-    g_importableDMABUFs.emplace(key);
-    return true;
-}
-
-static SP<Render::IRenderbuffer> hkGetOrCreateRenderbuffer(void* thisptr, SP<Aquamarine::IBuffer> buffer, uint32_t fmt) {
-    if (!canImportDMABUFForRenderbuffer(buffer))
+SP<ITexture> sdrCopy(const SP<ITexture>& texture) {
+    const auto found = sdrCopies.find(texture.get());
+    if (found == sdrCopies.end())
         return nullptr;
-
-    return ((origGetOrCreateRenderbuffer)g_getOrCreateRBHook->m_original)(thisptr, buffer, fmt);
-}
-
-static NColorManagement::PImageDescription captureImageDescription() {
-    return NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
-}
-
-static bool ensureCaptureShader();
-static SP<Render::IFramebuffer> renderSDRBlurFromHDRSource(Render::CRenderContext& ctx, const SP<Render::IFramebuffer>& source, float a, const CRegion& originalDamage);
-
-static bool currentMonitorInHDR(Render::CRenderContext& ctx) {
-    const auto monitorRef = ctx.m_data.pMonitor;
-    const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
-    return monitor && monitor->inHDR();
-}
-
-static PHLMONITOR currentMonitor(Render::CRenderContext& ctx) {
-    const auto monitorRef = ctx.m_data.pMonitor;
-    return monitorRef ? monitorRef.lock() : PHLMONITOR{};
-}
-
-static float correctHDRAlpha(float alpha) {
-    alpha = std::clamp(alpha, 0.0F, 1.0F);
-    if (alpha <= 0.0F || alpha >= 1.0F)
-        return alpha;
-
-    return 1.0F - std::pow(1.0F - alpha, HDR_ALPHA_CORRECTION_EXPONENT);
-}
-
-static void appendSurfaceDebugLog(const std::string& line) {
-    FILE* file = std::fopen(SURFACE_DEBUG_LOG, "a");
-    if (!file)
-        return;
-
-    std::fputs(line.c_str(), file);
-    std::fputc('\n', file);
-    std::fclose(file);
-}
-
-static SP<Render::IFramebuffer> hkBlurFramebuffer(void* thisptr, Render::CRenderContext& ctx, SP<Render::IFramebuffer> source, float a,
-                                                const CRegion& originalDamage, const Render::SBlurContext& context) {
-    auto fb = currentMonitorInHDR(ctx) ? renderSDRBlurFromHDRSource(ctx, source, a, originalDamage) : nullptr;
-    if (!fb)
-        fb = ((origBlurFramebuffer)g_blurFramebufferHook->m_original)(thisptr, ctx, source, a, originalDamage, context);
-
-    if (currentMonitorInHDR(ctx) && fb && fb->getTexture())
-        g_srgbBlurTextures.emplace(reinterpret_cast<uintptr_t>(fb->getTexture().get()));
-
-    return fb;
-}
-
-static void hkPreDrawSurface(void* thisptr, Render::CRenderContext& ctx, WP<CSurfacePassElement> element, const CRegion& damage) {
-    const auto monitor = currentMonitor(ctx);
-    if (!monitor || !monitor->inHDR() || !element) {
-        ((origPreDrawSurface)g_preDrawSurfaceHook->m_original)(thisptr, ctx, element, damage);
-        return;
+    const auto source = found->second.source.lock();
+    const auto copy = found->second.copy.lock();
+    if (source != texture || !copy || !copy->m_imageDescription || isHDR(copy->m_imageDescription) || copy->m_size != texture->m_size) {
+        sdrCopies.erase(found);
+        return nullptr;
     }
+    return copy;
+}
 
-    auto surface = Desktop::View::CWLSurface::fromResource(element->m_data.surface);
-    const float alphaModifier = surface ? surface->m_alphaModifier : 1.0F;
-    const float overallOpacity = surface ? surface->m_overallOpacity : 1.0F;
-    const float totalAlpha = element->m_data.alpha * element->m_data.fadeAlpha * alphaModifier * overallOpacity;
-    const float correctedTotalAlpha = correctHDRAlpha(totalAlpha);
-    const auto  tex = element->m_data.texture;
+PImageDescription sourceDescription(CRenderContext& ctx, const SP<ITexture>& texture, const TextureData& data) {
+    if (texture->m_imageDescription)
+        return texture->m_imageDescription;
+    if (ctx.m_data.surface && ctx.m_data.surface->m_colorManagement)
+        return CImageDescription::from(ctx.m_data.surface->m_colorManagement->imageDescription());
+    if (data.cmBackToSRGB || data.finalMonitorCM)
+        return g_pHyprRenderer->workBufferImageDescription(ctx);
+    return getDefaultImageDescription();
+}
 
-    if (tex && (totalAlpha < 0.999F || tex->m_type == Render::TEXTURE_RGBA || !tex->m_opaque)) {
-        const auto key = reinterpret_cast<uintptr_t>(element->m_data.surface.get());
-        auto&      timer = g_surfaceDebugTimers[key];
+void setCaptureUniforms(CShader& shader, const Draw& draw) {
+    const auto program = shader.program();
+    const auto uniform = [&](const char* name) { return glGetUniformLocation(program, name); };
+    const auto monitor = draw.ctx.m_data.pMonitor;
+    const auto target = draw.capture == Capture::MIRROR ? draw.ctx.m_data.currentFB->getMirrorTexture()->m_imageDescription : draw.ctx.m_data.currentFB->imageDescription();
+    glUniform1i(uniform("hdrfixSDRCopy"), 3);
+    glUniform1i(uniform("hdrfixBlurCopy"), 4);
+    glUniform1i(uniform("hdrfixOutputTF"), target ? target->value().transferFunction : CM_TRANSFER_FUNCTION_SRGB);
+    glUniform2f(uniform("hdrfixSDRRange"), std::max(0.F, monitor->m_sdrMinLuminance), std::max(1.F, float(monitor->m_sdrMaxLuminance)));
+    for (int i = 0; i < 2; ++i) {
+        if (!(i == 0 ? draw.captureSource : draw.captureBlur))
+            continue;
+        const auto& source = i == 0 ? draw.source : draw.blur;
+        const auto& description = source.description->value();
+        const auto indexed = [&](const char* name) { return uniform(std::format("{}[{}]", name, i).c_str()); };
+        glUniform1i(indexed("hdrfixUseCopy"), !!source.copy);
+        glUniform1i(indexed("hdrfixSourceTF"), description.transferFunction);
+        glUniform1i(indexed("hdrfixCopyTF"), source.copy ? source.copy->m_imageDescription->value().transferFunction : CM_TRANSFER_FUNCTION_SRGB);
+        const bool nits = description.transferFunction == CM_TRANSFER_FUNCTION_LINEAR;
+        glUniform2f(indexed("hdrfixSourceRange"), nits ? 0.F : description.getTFMinLuminance(), nits ? 1.F : description.getTFMaxLuminance());
+        glUniform2f(indexed("hdrfixInverseMods"), source.displayAdjusted && monitor->m_sdrBrightness > 0 ? 1.F / monitor->m_sdrBrightness : 1.F,
+                    source.displayAdjusted && monitor->m_sdrSaturation > 0 ? 1.F / monitor->m_sdrSaturation : 1.F);
+        const auto settings = g_pHyprRenderer->getCMSettings(draw.ctx, source.description, DEFAULT_SRGB_IMAGE_DESCRIPTION, nullptr, false);
+        const auto& matrix = settings.convertMatrix;
+        const GLfloat conversion[] = {float(matrix[0][0]), float(matrix[1][0]), float(matrix[2][0]), float(matrix[0][1]), float(matrix[1][1]),
+                                      float(matrix[2][1]), float(matrix[0][2]), float(matrix[1][2]), float(matrix[2][2])};
+        glUniformMatrix3fv(indexed("hdrfixToSRGB"), 1, GL_FALSE, conversion);
+        if (source.copy) {
+            GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE3 + i);
+            source.copy->bind();
+            source.copy->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            source.copy->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE0);
+            ++copyDraws;
+        } else
+            ++tonemapDraws;
+    }
+}
 
-        if (timer.getSeconds() >= 1.0) {
-            timer.reset();
-            const auto window = element->m_data.pWindow;
-            const auto cls    = window ? window->metadata().appID() : std::string{"<no-window>"};
-            const auto title  = window ? window->metadata().title() : std::string{"<no-title>"};
-
-            appendSurfaceDebugLog(std::format(
-                "class='{}' title='{}' alpha={} fade={} alphaModifier={} overallOpacity={} total={} corrected={} texType={} texOpaque={} surface={:x}",
-                cls, title, element->m_data.alpha, element->m_data.fadeAlpha, alphaModifier, overallOpacity, totalAlpha, correctedTotalAlpha, sc<int>(tex->m_type),
-                tex->m_opaque, key));
+WP<CShader> hkGetShader(void* self, ePreparedFragmentShader frag, const SShaderVariant& variant) {
+    const auto original = [&] { return reinterpret_cast<WP<CShader> (*)(void*, ePreparedFragmentShader, const SShaderVariant&)>(getShaderHook->m_original)(self, frag, variant); };
+    const bool captureSource = currentDraw && currentDraw->captureSource && currentDraw->capture != Capture::NONE;
+    const bool captureBlur = currentDraw && currentDraw->captureBlur && currentDraw->capture != Capture::NONE && (variant.features & SH_FEAT_BLUR);
+    const Capture capture = captureSource || captureBlur ? currentDraw->capture : Capture::NONE;
+    const bool alpha = correctPixelAlpha && (variant.features & SH_FEAT_RGBA);
+    const bool scalar = correctScalarAlpha;
+    if (frag != SH_FRAG_SURFACE || (!alpha && !scalar && capture == Capture::NONE))
+        return original();
+    const ShaderKey key{variant, capture, alpha, scalar, captureSource, captureBlur};
+    auto found = shaders.find(key);
+    if (found == shaders.end()) {
+        try {
+            auto nativeVariant = variant;
+            if (capture == Capture::PRIMARY && captureSource)
+                nativeVariant.features &= ~(SH_FEAT_CM | SH_FEAT_TONEMAP | SH_FEAT_ALT_TONEMAP | SH_FEAT_SDR_MOD | SH_FEAT_ICC);
+            auto source = HDRFix::patchSurfaceShader(g_pShaderLoader->getVariantSource(frag, nativeVariant), alpha, captureSource && capture == Capture::PRIMARY,
+                                                     captureSource && capture == Capture::MIRROR, captureBlur, variant.features & SH_FEAT_MIRROR, scalar);
+            auto shader = makeShared<CShader>();
+            if (!shader->createProgram(GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, source, true, false))
+                throw std::runtime_error("Cannot compile HDR texture shader");
+            found = shaders.emplace(key, shader).first;
+        } catch (const std::exception& error) {
+            ++shaderFailures;
+            Log::logger->log(Log::ERR, "[hyprland-fix-hdr] {}", error.what());
+            // Cache failure too; retry only after a reload or native shader rebuild.
+            found = shaders.emplace(key, nullptr).first;
         }
     }
-
-    const bool  correctScalarAlpha  = tex && totalAlpha > 0.0F && totalAlpha < 1.0F;
-    const bool  correctTextureAlpha = tex && tex->m_type == Render::TEXTURE_RGBA && !tex->m_opaque && totalAlpha >= 0.999F;
-    const auto  textureKey = correctTextureAlpha ? reinterpret_cast<uintptr_t>(tex.get()) : 0;
-    const auto  scalarTextureKey = correctScalarAlpha ? reinterpret_cast<uintptr_t>(tex.get()) : 0;
-
-    if (correctScalarAlpha)
-        g_scalarAlphaCorrectionTextures.emplace(scalarTextureKey);
-    if (correctTextureAlpha)
-        g_alphaCorrectionTextures.emplace(textureKey);
-
-    ((origPreDrawSurface)g_preDrawSurfaceHook->m_original)(thisptr, ctx, element, damage);
-
-    if (correctTextureAlpha)
-        g_alphaCorrectionTextures.erase(textureKey);
-    if (correctScalarAlpha)
-        g_scalarAlphaCorrectionTextures.erase(scalarTextureKey);
-}
-
-static WP<CShader> hkGetShaderVariant(void* thisptr, Render::ePreparedFragmentShader frag, const Render::SShaderVariant& variant) {
-    if (!g_correctSurfaceAlphaShader || frag != Render::SH_FRAG_SURFACE || !(variant.features & Render::SH_FEAT_RGBA) || !Render::g_pShaderLoader ||
-        !Render::GL::g_pHyprOpenGL || !Render::GL::g_pHyprOpenGL->m_shaders) {
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
+    if (!found->second)
+        return original();
+    auto shader = found->second;
+    GL::g_pHyprOpenGL->useShader(shader);
+    if (capture != Capture::NONE) {
+        auto uniforms = *currentDraw;
+        uniforms.captureSource = captureSource;
+        uniforms.captureBlur = captureBlur;
+        setCaptureUniforms(*shader, uniforms);
     }
-
-    if (auto it = g_alphaCorrectionSurfaceShaders.find(variant); it != g_alphaCorrectionSurfaceShaders.end())
-        return it->second;
-
-    auto source = Render::g_pShaderLoader->getVariantSource(frag, variant);
-
-    static constexpr std::string_view NEEDLE = "vec4 pixColor = texture(tex, v_texcoord);";
-    const auto                        pos    = source.find(NEEDLE);
-    if (pos == std::string::npos)
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
-
-    const auto replacement = std::format(R"SHADER(vec4 pixColor = texture(tex, v_texcoord);
-    if (pixColor.a > 0.0 && pixColor.a < 1.0)
-        pixColor.a = 1.0 - pow(1.0 - pixColor.a, {:.8f});)SHADER",
-                                         HDR_ALPHA_CORRECTION_EXPONENT);
-    source.replace(pos, NEEDLE.size(), replacement);
-
-    auto shader = makeShared<CShader>();
-    if (!shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, source, true, true))
-        return ((origGetShaderVariant)g_getShaderVariantHook->m_original)(thisptr, frag, variant);
-
-    g_alphaCorrectionSurfaceShaders.emplace(variant, shader);
     return shader;
 }
 
-static void hkRenderTextureInternal(void* thisptr, Render::CRenderContext& ctx, SP<Render::ITexture> tex, const CBox& box, const Render::GL::CHyprOpenGLImpl::STextureRenderData& data) {
-    const auto key          = reinterpret_cast<uintptr_t>(tex.get());
-    const auto monitor      = currentMonitor(ctx);
-    const bool relabelBlur  = monitor && monitor->inHDR() && tex && g_srgbBlurTextures.contains(key);
-    const auto originalDesc = relabelBlur ? tex->m_imageDescription : NColorManagement::PImageDescription{};
-    const bool correctTextureAlpha = monitor && monitor->inHDR() && !relabelBlur && !data.discardActive && g_alphaCorrectionTextures.contains(key);
-    const bool correctScalarAlpha =
-        monitor && monitor->inHDR() && !relabelBlur && !data.discardActive && g_scalarAlphaCorrectionTextures.contains(key) && data.a > 0.0F && data.a < 1.0F;
-    const bool previousCorrectSurfaceAlphaShader = g_correctSurfaceAlphaShader;
-    auto       correctedData = data;
-
-    if (relabelBlur)
-        tex->m_imageDescription = NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION;
-
-    if (correctScalarAlpha)
-        correctedData.a = correctHDRAlpha(data.a);
-
-    g_correctSurfaceAlphaShader = correctTextureAlpha;
-    ((origRenderTextureInternal)g_renderTextureHook->m_original)(thisptr, ctx, tex, box, correctedData);
-    g_correctSurfaceAlphaShader = previousCorrectSurfaceAlphaShader;
-
-    if (relabelBlur) {
-        tex->m_imageDescription = originalDesc;
-        g_srgbBlurTextures.erase(key);
+WP<CShader> hkRenderToFB(void* self, CRenderContext& ctx, SP<ITexture> texture, const TextureData& data, eTextureType type, const CBox& box) {
+    Draw draw{.ctx = ctx, .source = {.description = sourceDescription(ctx, texture, data), .copy = sdrCopy(texture)}, .blur = {}};
+    if (data.blurredBG)
+        draw.blur = {data.blurredBG->m_imageDescription, sdrCopy(data.blurredBG), true};
+    if (ctx.m_data.pMonitor && ctx.m_data.pMonitor->inHDR() && !data.finalMonitorCM) {
+        const bool mirror = ctx.m_data.currentFB->getMirrorTexture() && ctx.m_data.pMonitor->needsUnmodifiedCopy();
+        const auto target = ctx.m_data.currentFB->imageDescription();
+        draw.captureSource = isHDR(draw.source.description);
+        draw.captureBlur = data.blur && isHDR(draw.blur.description);
+        if (draw.captureSource || draw.captureBlur)
+            draw.capture = mirror ? Capture::MIRROR : target && !isHDR(target) ? Capture::PRIMARY : Capture::NONE;
+        // Leave the completed monitor copy to Hyprland, including its behavior
+        // when the user disables keep_unmodified_copy. Only reuse its SDR copy.
+        if (draw.capture == Capture::PRIMARY && !draw.source.copy && ctx.m_data.mainFB && texture == ctx.m_data.mainFB->getTexture())
+            draw.capture = Capture::NONE;
+        if (draw.source.copy == ctx.m_data.currentFB->getMirrorTexture())
+            draw.source.copy.reset(); // Never sample an attachment being written.
+        if (draw.blur.copy == ctx.m_data.currentFB->getMirrorTexture())
+            draw.blur.copy.reset();
+        // Only compositor-owned HDR buffers contain the monitor's SDR adjustment.
+        draw.source.displayAdjusted = texture->m_imageDescription &&
+            (draw.source.description->value().transferFunction == CM_TRANSFER_FUNCTION_LINEAR || draw.source.description->value().transferFunction == CM_TRANSFER_FUNCTION_EXT_LINEAR) &&
+            !ctx.m_data.surface;
     }
+    const auto previous = currentDraw;
+    currentDraw = &draw;
+    const CScopeGuard restore([&] { currentDraw = previous; });
+    return reinterpret_cast<WP<CShader> (*)(void*, CRenderContext&, SP<ITexture>, const TextureData&, eTextureType, const CBox&)>(renderToFBHook->m_original)(self, ctx, texture, data, type, box);
 }
 
-static bool ensureCaptureShader() {
-    if (g_captureShader)
-        return true;
-
-    if (!Render::GL::g_pHyprOpenGL || !Render::GL::g_pHyprOpenGL->m_shadersInitialized || !Render::GL::g_pHyprOpenGL->m_shaders)
-        return false;
-
-    static const std::string FRAG = R"SHADER(
-#version 300 es
-precision highp float;
-in vec2 v_texcoord;
-uniform sampler2D tex;
-uniform float sdrMinLuminance;
-uniform float sdrMaxLuminance;
-uniform float inverseSdrBrightness;
-uniform float inverseSdrSaturation;
-uniform float contrast;
-uniform float brightness;
-layout(location = 0) out vec4 fragColor;
-
-const float EXT_LINEAR_MIN_LUMINANCE = 0.0;
-const float EXT_LINEAR_MAX_LUMINANCE = 80.0;
-
-vec3 applySaturation(vec3 color, float saturation) {
-    float y = dot(color, vec3(0.2126, 0.7152, 0.0722));
-    return mix(vec3(y), color, saturation);
-}
-
-vec3 gain(vec3 src, float k) {
-    vec3 x = clamp(src, 0.0, 1.0);
-    vec3 t = step(0.5, x);
-    vec3 y = mix(x, 1.0 - x, t);
-    vec3 a = 0.5 * pow(2.0 * y, vec3(k));
-    return mix(a, 1.0 - a, t);
-}
-
-vec3 linearToSrgb(vec3 color) {
-    bvec3 cutoff = lessThanEqual(color, vec3(0.0031308));
-    vec3  lo     = color * 12.92;
-    vec3  hi     = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-    return mix(hi, lo, cutoff);
-}
-
-void main() {
-    vec4 src = texture(tex, v_texcoord);
-    vec3 rgb = max(src.rgb, vec3(0.0));
-
-    rgb *= inverseSdrBrightness;
-    rgb = applySaturation(rgb, inverseSdrSaturation);
-
-    rgb = rgb * (EXT_LINEAR_MAX_LUMINANCE - EXT_LINEAR_MIN_LUMINANCE) + vec3(EXT_LINEAR_MIN_LUMINANCE);
-
-    float sdrRange = max(sdrMaxLuminance - sdrMinLuminance, 0.001);
-    rgb            = clamp((rgb - vec3(sdrMinLuminance)) / sdrRange, 0.0, 1.0);
-    rgb            = linearToSrgb(rgb);
-
-    if (contrast != 1.0)
-        rgb = gain(rgb, contrast);
-    rgb *= max(1.0, brightness);
-
-    fragColor = vec4(rgb, 1.0);
-}
-)SHADER";
-
-    g_captureShader = makeShared<CShader>();
-    if (!g_captureShader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC, FRAG, true, true)) {
-        g_captureShader.reset();
-        return false;
+void hkPreDrawSurface(void* self, CRenderContext& ctx, WP<CSurfacePassElement> element, const CRegion& damage) {
+    const auto original = [&] { reinterpret_cast<void (*)(void*, CRenderContext&, WP<CSurfacePassElement>, const CRegion&)>(preDrawSurfaceHook->m_original)(self, ctx, element, damage); };
+    if (!element || !hdrTarget(ctx)) {
+        original();
+        return;
     }
-
-    return true;
-}
-
-static bool renderCaptureShader(Render::CRenderContext& ctx,
-                                const SP<Render::ITexture>& sourceTex,
-                                const SP<Render::IFramebuffer>& mirrorFB,
-                                const CBox& box,
-                                const float sdrMinLuminance,
-                                const float sdrMaxLuminance,
-                                const float inverseSdrBrightness,
-                                const float inverseSdrSaturation) {
-    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !mirrorFB || !ensureCaptureShader())
-        return false;
-
-    auto guard = g_pHyprRenderer->bindTempFB(ctx, mirrorFB);
-
-    Render::GL::g_pHyprOpenGL->blend(false);
-
-    const auto& glMatrix = g_pHyprRenderer->projectBoxToTarget(ctx, box);
-
-    Render::GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE0);
-    sourceTex->bind();
-    sourceTex->setTexParameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    sourceTex->setTexParameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    sourceTex->setTexParameter(GL_TEXTURE_MAG_FILTER, sourceTex->magFilter);
-    sourceTex->setTexParameter(GL_TEXTURE_MIN_FILTER, sourceTex->minFilter);
-
-    auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
-    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
-    shader->setUniformInt(SHADER_TEX, 0);
-    glUniform1f(glGetUniformLocation(shader->program(), "sdrMinLuminance"), sdrMinLuminance);
-    glUniform1f(glGetUniformLocation(shader->program(), "sdrMaxLuminance"), sdrMaxLuminance);
-    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
-    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
-    glUniform1f(glGetUniformLocation(shader->program(), "contrast"), 1.0F);
-    glUniform1f(glGetUniformLocation(shader->program(), "brightness"), 1.0F);
-
-    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
-    glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
-    glBufferData(GL_ARRAY_BUFFER, sizeof(Render::GL::fullVerts), nullptr, GL_DYNAMIC_DRAW);
-
-    auto verts = Render::GL::fullVerts;
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts.data());
-
-    ctx.m_data.finalDamage.forEachRect([&ctx](const auto& rect) {
-        Render::GL::g_pHyprOpenGL->scissor(ctx, &rect, ctx.m_data.transformDamage);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    const auto surface = Desktop::View::CWLSurface::fromResource(element->m_data.surface);
+    const float alpha = element->m_data.alpha * element->m_data.fadeAlpha * (surface ? surface->m_alphaModifier * surface->m_overallOpacity : 1.F);
+    const auto texture = element->m_data.texture;
+    const bool scalar = texture && alpha > 0.F && alpha < 1.F;
+    const bool pixel = texture && texture->m_type == TEXTURE_RGBA && !texture->m_opaque && alpha >= 0.999F;
+    if (scalar)
+        scalarAlphaTextures.insert(texture.get());
+    if (pixel)
+        pixelAlphaTextures.insert(texture.get());
+    const CScopeGuard restore([&] {
+        if (scalar) scalarAlphaTextures.erase(texture.get());
+        if (pixel) pixelAlphaTextures.erase(texture.get());
     });
-
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    sourceTex->unbind();
-    Render::GL::g_pHyprOpenGL->scissor(ctx, nullptr);
-    Render::GL::g_pHyprOpenGL->blend(true);
-
-    return true;
+    original();
 }
 
-static bool renderCaptureShaderToFB(Render::CRenderContext& ctx,
-                                    const SP<Render::ITexture>& sourceTex,
-                                    const SP<Render::IFramebuffer>& targetFB,
-                                    const Mat3x3& matrix,
-                                    const CRegion& damage,
-                                    const float sdrMinLuminance,
-                                    const float sdrMaxLuminance,
-                                    const float inverseSdrBrightness,
-                                    const float inverseSdrSaturation,
-                                    const float contrast,
-                                    const float brightness) {
-    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !targetFB || !ensureCaptureShader())
-        return false;
-
-    auto guard = g_pHyprRenderer->bindTempFB(ctx, targetFB);
-
-    dc<Render::GL::CGLFramebuffer*>(targetFB.get())->clearAfterInvalidation();
-
-    Render::GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE0);
-    sourceTex->bind();
-    sourceTex->setTexParameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    sourceTex->setTexParameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    sourceTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    sourceTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-    auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
-    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, matrix.getMatrix());
-    shader->setUniformInt(SHADER_TEX, 0);
-    glUniform1f(glGetUniformLocation(shader->program(), "sdrMinLuminance"), sdrMinLuminance);
-    glUniform1f(glGetUniformLocation(shader->program(), "sdrMaxLuminance"), sdrMaxLuminance);
-    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
-    glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
-    glUniform1f(glGetUniformLocation(shader->program(), "contrast"), contrast);
-    glUniform1f(glGetUniformLocation(shader->program(), "brightness"), brightness);
-
-    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
-    glBindBuffer(GL_ARRAY_BUFFER, shader->getUniformLocation(SHADER_SHADER_VBO));
-    glBufferData(GL_ARRAY_BUFFER, sizeof(Render::GL::fullVerts), nullptr, GL_DYNAMIC_DRAW);
-
-    auto verts = Render::GL::fullVerts;
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts.data());
-
-    if (!damage.empty()) {
-        damage.forEachRect([&ctx](const auto& rect) {
-            Render::GL::g_pHyprOpenGL->scissor(ctx, &rect, false);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        });
-    }
-
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    sourceTex->unbind();
-    Render::GL::g_pHyprOpenGL->scissor(ctx, nullptr);
-
-    return true;
+void hkRenderTexture(void* self, CRenderContext& ctx, SP<ITexture> texture, const CBox& box, const TextureData& data) {
+    const bool correct = hdrTarget(ctx) && !data.discardActive;
+    const bool previous = correctPixelAlpha;
+    const bool previousScalar = correctScalarAlpha;
+    correctPixelAlpha = correct && pixelAlphaTextures.contains(texture.get());
+    correctScalarAlpha = correct && scalarAlphaTextures.contains(texture.get()) && data.a > 0.F && data.a < 1.F;
+    const CScopeGuard restore([&] { correctPixelAlpha = previous; correctScalarAlpha = previousScalar; });
+    reinterpret_cast<void (*)(void*, CRenderContext&, SP<ITexture>, const CBox&, const TextureData&)>(renderTextureHook->m_original)(self, ctx, texture, box, data);
 }
 
-static SP<Render::IFramebuffer> renderSDRBlurFromHDRSource(Render::CRenderContext& ctx, const SP<Render::IFramebuffer>& source, float a, const CRegion& originalDamage) {
-    if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !source || !source->getTexture())
-        return nullptr;
-
-    const auto monitor = currentMonitor(ctx);
-    if (!monitor || !monitor->inHDR())
-        return nullptr;
-
-    const auto resources = monitor->resources();
-    if (!resources)
-        return nullptr;
-
-    const auto blurFB     = g_pHyprRenderer->getWorkBuffer(ctx);
-    const auto blurSwapFB = g_pHyprRenderer->getWorkBuffer(ctx);
-    if (!blurFB || !blurSwapFB || blurFB == blurSwapFB)
-        return nullptr;
-
-    static auto PBLURSIZE             = CConfigValue<Config::INTEGER>("decoration:blur:size");
-    static auto PBLURPASSES           = CConfigValue<Config::INTEGER>("decoration:blur:passes");
-    static auto PBLURVIBRANCY         = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy");
-    static auto PBLURVIBRANCYDARKNESS = CConfigValue<Config::FLOAT>("decoration:blur:vibrancy_darkness");
-    static auto PBLURCONTRAST         = CConfigValue<Config::FLOAT>("decoration:blur:contrast");
-    static auto PBLURNOISE            = CConfigValue<Config::FLOAT>("decoration:blur:noise");
-    static auto PBLURBRIGHTNESS       = CConfigValue<Config::FLOAT>("decoration:blur:brightness");
-
-    CBox       monitorBox = {0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
-    const auto glMatrix   = g_pHyprRenderer->projectBoxToTarget(ctx, monitorBox);
-
-    const auto blurPasses = std::clamp(*PBLURPASSES, sc<int64_t>(1), sc<int64_t>(8));
-    CRegion   damage{originalDamage};
-    // The renderer now supplies blur damage in framebuffer coordinates.
-    g_pHyprRenderer->expandBlurDamage(damage);
-
-    const float sdrMaxLuminance = std::max<float>(1.0F, monitor->m_sdrMaxLuminance);
-    const float sdrMinLuminance = std::max<float>(0.0F, monitor->m_sdrMinLuminance);
-    const float inverseSdrBrightness = monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
-    const float inverseSdrSaturation = monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
-
-    const bool blendWasEnabled = glIsEnabled(GL_BLEND);
-    Render::GL::g_pHyprOpenGL->blend(false);
-    Render::GL::g_pHyprOpenGL->setCapStatus(GL_STENCIL_TEST, false);
-
-    if (!renderCaptureShaderToFB(ctx, source->getTexture(), blurSwapFB, glMatrix, damage, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation,
-                                 *PBLURCONTRAST, *PBLURBRIGHTNESS)) {
-        Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
-        return nullptr;
+void hook(CFunctionHook*& destination, const std::string& name, const std::string& signature, void* replacement) {
+    void* address = nullptr;
+    for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, name)) {
+        if (match.demangled.find(signature) == std::string::npos)
+            continue;
+        if (address)
+            throw std::runtime_error("Ambiguous HDR hook: " + name);
+        address = match.address;
     }
-
-    auto currentRenderToFB = blurSwapFB;
-
-    auto drawPass = [&](WP<CShader> shader, Render::ePreparedFragmentShader frag, CRegion* passDamage) {
-        if (currentRenderToFB == blurFB)
-            blurSwapFB->bind();
-        else
-            blurFB->bind();
-
-        Render::GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE0);
-        auto currentTex = currentRenderToFB->getTexture();
-        currentTex->bind();
-        currentTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-        shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
-        shader->setUniformFloat(SHADER_RADIUS, *PBLURSIZE * a);
-        if (frag == Render::SH_FRAG_BLUR1) {
-            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5F / (monitor->m_transformedSize.x / 2.F), 0.5F / (monitor->m_transformedSize.y / 2.F));
-            shader->setUniformInt(SHADER_PASSES, blurPasses);
-            shader->setUniformFloat(SHADER_VIBRANCY, *PBLURVIBRANCY);
-            shader->setUniformFloat(SHADER_VIBRANCY_DARKNESS, *PBLURVIBRANCYDARKNESS);
-        } else
-            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5F / (monitor->m_transformedSize.x * 2.F), 0.5F / (monitor->m_transformedSize.y * 2.F));
-        shader->setUniformInt(SHADER_TEX, 0);
-
-        glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
-
-        if (!passDamage->empty()) {
-            passDamage->forEachRect([&ctx](const auto& rect) {
-                Render::GL::g_pHyprOpenGL->scissor(ctx, &rect, false);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            });
-        }
-
-        glBindVertexArray(0);
-
-        currentRenderToFB = currentRenderToFB == blurFB ? blurSwapFB : blurFB;
-    };
-
-    CRegion tempDamage{damage};
-
-    blurFB->bind();
-    dc<Render::GL::CGLFramebuffer*>(blurFB.get())->clearAfterInvalidation();
-
-    auto shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLUR1));
-    for (auto i = 1; i <= blurPasses; ++i) {
-        tempDamage = damage.copy().scale(1.F / (1 << i));
-        drawPass(shader, Render::SH_FRAG_BLUR1, &tempDamage);
-    }
-
-    shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLUR2));
-    for (auto i = blurPasses - 1; i >= 0; --i) {
-        tempDamage = damage.copy().scale(1.F / (1 << i));
-        drawPass(shader, Render::SH_FRAG_BLUR2, &tempDamage);
-    }
-
-    if (currentRenderToFB == blurFB)
-        blurSwapFB->bind();
-    else
-        blurFB->bind();
-
-    Render::GL::g_pHyprOpenGL->setActiveTexture(GL_TEXTURE0);
-    auto currentTex = currentRenderToFB->getTexture();
-    currentTex->bind();
-    currentTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-    shader = Render::GL::g_pHyprOpenGL->useShader(Render::GL::g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_BLURFINISH));
-    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
-    shader->setUniformFloat(SHADER_NOISE, *PBLURNOISE);
-    shader->setUniformFloat(SHADER_BRIGHTNESS, *PBLURBRIGHTNESS);
-    shader->setUniformInt(SHADER_TEX, 0);
-
-    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
-    if (!damage.empty()) {
-        damage.forEachRect([&ctx](const auto& rect) {
-            Render::GL::g_pHyprOpenGL->scissor(ctx, &rect, false);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        });
-    }
-    glBindVertexArray(0);
-
-    currentRenderToFB = currentRenderToFB == blurFB ? blurSwapFB : blurFB;
-    Render::GL::g_pHyprOpenGL->scissor(ctx, nullptr);
-    currentTex->unbind();
-    Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
-
-    return currentRenderToFB;
+    if (!address)
+        throw std::runtime_error("Missing HDR hook: " + name);
+    destination = HyprlandAPI::createFunctionHook(pluginHandle, address, replacement);
+    if (!destination || !destination->hook())
+        throw std::runtime_error("Cannot install HDR hook: " + name);
 }
-
-static bool hkSaveBufferForMirror(void* thisptr, Render::CRenderContext& ctx, const CBox& box) {
-    const auto monitorRef = ctx.m_data.pMonitor;
-    const auto monitor    = monitorRef ? monitorRef.lock() : PHLMONITOR{};
-
-    if (!monitor || !monitor->inHDR()) {
-        return ((origSaveBufferForMirror)g_saveBufferForMirrorHook->m_original)(thisptr, ctx, box);
-    }
-
-    const auto resources = monitor->resources();
-    if (!resources || !g_pHyprRenderer || !ctx.m_data.currentFB)
-        return false;
-
-    const auto sourceTex = resources->m_mirrorTex ? resources->m_mirrorTex : ctx.m_data.currentFB->getTexture();
-    const auto mirrorFB  = resources->mirrorFB();
-    if (!sourceTex || !mirrorFB)
-        return false;
-
-    if (mirrorFB)
-        mirrorFB->setImageDescription(captureImageDescription());
-
-    const float sdrMaxLuminance = std::max<float>(1.0F, monitor->m_sdrMaxLuminance);
-    const float sdrMinLuminance = std::max<float>(0.0F, monitor->m_sdrMinLuminance);
-    const float inverseSdrBrightness = monitor && monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
-    const float inverseSdrSaturation = monitor && monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
-
-    return renderCaptureShader(ctx, sourceTex, mirrorFB, box, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation);
-}
-
-static void* findFnOrThrow(const std::string& name, std::initializer_list<std::string_view> demangledNeedles) {
-    auto fns = HyprlandAPI::findFunctionsByName(g_pluginHandle, name);
-    if (fns.empty())
-        throw std::runtime_error(std::format("[hyprland-fix-hdr:capture] No functions found for {}", name));
-
-    if (demangledNeedles.size() == 0 || (demangledNeedles.size() == 1 && demangledNeedles.begin()->empty()))
-        return fns[0].address;
-
-    std::vector<SFunctionMatch> matches;
-    matches.reserve(fns.size());
-    for (const auto& fn : fns) {
-        for (const auto& needle : demangledNeedles) {
-            if (needle.empty() || fn.demangled.find(needle) != std::string::npos) {
-                matches.push_back(fn);
-                break;
-            }
-        }
-    }
-
-    if (matches.empty())
-        throw std::runtime_error(std::format("[hyprland-fix-hdr:capture] No matching overload for {}", name));
-
-    if (matches.size() > 1)
-        throw std::runtime_error(std::format("[hyprland-fix-hdr:capture] Ambiguous overload for {}", name));
-
-    return matches[0].address;
 }
 
 void HDRFix::initScreenshare(HANDLE handle) {
-    g_pluginHandle = handle;
-    const std::string HASH        = __hyprland_api_get_hash();
-    const std::string CLIENT_HASH = __hyprland_api_get_client_hash();
-
-    if (HASH != CLIENT_HASH)
-        throw std::runtime_error("Version mismatch: headers version is not equal to running Hyprland version");
-
-    g_disableUnmodifiedCopyMRT = true;
-    g_needsUnmodifiedCopyHook  = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("needsUnmodifiedCopy", {"CMonitor::needsUnmodifiedCopy("}),
-        (void*)hkNeedsUnmodifiedCopy);
-
-    if (!g_needsUnmodifiedCopyHook || !g_needsUnmodifiedCopyHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook CMonitor::needsUnmodifiedCopy");
-
-    g_saveBufferForMirrorHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("saveBufferForMirror", {"CHyprOpenGLImpl::saveBufferForMirror("}),
-        (void*)hkSaveBufferForMirror);
-
-    if (!g_saveBufferForMirrorHook || !g_saveBufferForMirrorHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook CHyprOpenGLImpl::saveBufferForMirror");
-
-    g_getOrCreateRBHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("getOrCreateRenderbuffer", {"Render::IHyprRenderer::getOrCreateRenderbuffer("}),
-        (void*)hkGetOrCreateRenderbuffer);
-
-    if (!g_getOrCreateRBHook || !g_getOrCreateRBHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook Render::IHyprRenderer::getOrCreateRenderbuffer");
-
-    g_blurFramebufferHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("blurFramebuffer", {"CHyprGLRenderer::blurFramebuffer("}),
-        (void*)hkBlurFramebuffer);
-
-    if (!g_blurFramebufferHook || !g_blurFramebufferHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook CHyprGLRenderer::blurFramebuffer");
-
-    g_renderTextureHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("renderTextureInternal", {"CHyprOpenGLImpl::renderTextureInternal("}),
-        (void*)hkRenderTextureInternal);
-
-    if (!g_renderTextureHook || !g_renderTextureHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook CHyprOpenGLImpl::renderTextureInternal");
-
-    g_getShaderVariantHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("getShaderVariant", {"CHyprOpenGLImpl::getShaderVariant(Render::ePreparedFragmentShader, Render::SShaderVariant const&)"}),
-        (void*)hkGetShaderVariant);
-
-    if (!g_getShaderVariantHook || !g_getShaderVariantHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook CHyprOpenGLImpl::getShaderVariant");
-
-    g_preDrawSurfaceHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("preDrawSurface", {"Render::IElementRenderer::preDrawSurface("}),
-        (void*)hkPreDrawSurface);
-
-    if (!g_preDrawSurfaceHook || !g_preDrawSurfaceHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook Render::IElementRenderer::preDrawSurface");
-
-    scheduleRefreshForAllMonitors();
-
-
+    pluginHandle = handle;
+    hook(getTextureHook, "getTexture", "Render::IFramebuffer::getTexture()", reinterpret_cast<void*>(hkGetTexture));
+    hook(renderToFBHook, "renderToFBInternal", "CHyprOpenGLImpl::renderToFBInternal(", reinterpret_cast<void*>(hkRenderToFB));
+    hook(renderTextureHook, "renderTextureInternal", "CHyprOpenGLImpl::renderTextureInternal(", reinterpret_cast<void*>(hkRenderTexture));
+    hook(preDrawSurfaceHook, "preDrawSurface", "Render::IElementRenderer::preDrawSurface(", reinterpret_cast<void*>(hkPreDrawSurface));
+    hook(getShaderHook, "getShaderVariant", "CHyprOpenGLImpl::getShaderVariant(Render::ePreparedFragmentShader, Render::SShaderVariant const&)", reinterpret_cast<void*>(hkGetShader));
+    refreshMonitors();
 }
 
 void HDRFix::exitScreenshare() {
-    g_disableUnmodifiedCopyMRT = false;
-
-    if (g_needsUnmodifiedCopyHook) {
-        g_needsUnmodifiedCopyHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_needsUnmodifiedCopyHook);
-        g_needsUnmodifiedCopyHook = nullptr;
+    for (auto* hook : {&getShaderHook, &preDrawSurfaceHook, &renderTextureHook, &renderToFBHook, &getTextureHook}) {
+        if (!*hook)
+            continue;
+        (*hook)->unhook();
+        HyprlandAPI::removeFunctionHook(pluginHandle, *hook);
+        *hook = nullptr;
     }
+    shaders.clear();
+    sdrCopies.clear();
+    scalarAlphaTextures.clear();
+    pixelAlphaTextures.clear();
+    correctPixelAlpha = false;
+    correctScalarAlpha = false;
+    currentDraw = nullptr;
+    refreshMonitors();
+}
 
-    if (g_saveBufferForMirrorHook) {
-        g_saveBufferForMirrorHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_saveBufferForMirrorHook);
-        g_saveBufferForMirrorHook = nullptr;
-    }
-
-    if (g_getOrCreateRBHook) {
-        g_getOrCreateRBHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_getOrCreateRBHook);
-        g_getOrCreateRBHook = nullptr;
-    }
-
-    if (g_blurFramebufferHook) {
-        g_blurFramebufferHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_blurFramebufferHook);
-        g_blurFramebufferHook = nullptr;
-    }
-
-    if (g_renderTextureHook) {
-        g_renderTextureHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_renderTextureHook);
-        g_renderTextureHook = nullptr;
-    }
-
-    if (g_preDrawSurfaceHook) {
-        g_preDrawSurfaceHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_preDrawSurfaceHook);
-        g_preDrawSurfaceHook = nullptr;
-    }
-
-    if (g_getShaderVariantHook) {
-        g_getShaderVariantHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_getShaderVariantHook);
-        g_getShaderVariantHook = nullptr;
-    }
-
-
-
-    g_importableDMABUFs.clear();
-    g_srgbBlurTextures.clear();
-    g_scalarAlphaCorrectionTextures.clear();
-    g_alphaCorrectionTextures.clear();
-    g_alphaCorrectionSurfaceShaders.clear();
-    g_surfaceDebugTimers.clear();
-    g_captureShader.reset();
-    g_correctSurfaceAlphaShader = false;
-
-    scheduleRefreshForAllMonitors();
+std::string HDRFix::screenshareStatus() {
+    return std::format("{{\"version\":\"{}\",\"native_unmodified_copy\":true,\"per_texture_capture\":true,\"alpha_fixes\":true,\"alpha_scope\":\"monitor\",\"sdr_copy_draws\":{},\"tonemap_draws\":{},\"shader_failures\":{}}}", VERSION, copyDraws, tonemapDraws, shaderFailures);
 }

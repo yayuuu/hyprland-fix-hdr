@@ -34,14 +34,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         statusCommand=HyprlandAPI::registerHyprCtlCommand(handle,{.name="hdrfix",.match=IPC::Socket1::COMMAND_MATCH_PREFIX,.handler=[](const IPC::Socket1::SRequest& request) -> IPC::Socket1::SResponse {
             std::istringstream words(request.command);std::string name,action;words>>name>>action;
             if(!action.empty() && action!="status")return std::string("error: use hdrfix status");
-            return std::string("{\"version\":\"")+HDRFix::VERSION+"\",\"color_fixes\":true,\"alpha_fixes\":true,\"blur_fixes\":true,\"capture_color_fixes\":true}";
+            return HDRFix::screenshareStatus();
         }});
         if(!statusCommand)throw std::runtime_error("cannot register HDR color-fix status");
     } catch (...) {
         cleanup();
         throw;
     }
-    return {"hyprland-fix-hdr", "HDR color, alpha, blur and capture-color corrections", "daniel", HDRFix::VERSION};
+    return {"hyprland-fix-hdr", "HDR alpha and per-texture SDR capture corrections", "daniel", HDRFix::VERSION};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

@@ -10,7 +10,7 @@ commit_pins = [
 plugins = ["hyprland-fix-hdr"]
 
 [hyprland-fix-hdr]
-description = "HDR color, alpha, blur and capture-color corrections"
+description = "HDR alpha and per-texture SDR capture corrections"
 authors = ["daniel"]
 output = "hyprland-fix-hdr.so"
 build = ["make"]

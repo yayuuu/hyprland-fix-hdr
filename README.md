@@ -1,62 +1,43 @@
 # hyprland-fix-hdr
 
-HDR rendering, color, blur and screen-capture corrections for stock Hyprland.
+HDR alpha blending and per-texture SDR capture corrections for stock Hyprland.
 
-## What it does
+## Screen sharing, screenshots and mirrors
 
-### Fixes colors in screen sharing, screenshots and OBS capture
+The plugin uses Hyprland's native `render:keep_unmodified_copy` mechanism and
+capture pipeline. When a rendered HDR texture has a native SDR copy, the SDR
+output samples that copy. HDR textures without an SDR copy are mapped individually
+with the plugin's luminance mapping, including textures used for blurred backgrounds.
+The completed screen is not tonemapped again by the plugin.
 
-- Converts the HDR monitor mirror into a correctly described SDR/sRGB capture
-  image instead of treating HDR/FP16 values as ordinary SDR pixels.
-- Uses the monitor's active `sdr_min_luminance` and `sdr_max_luminance` to map
-  the captured image, rather than relying on a hardcoded default SDR range.
-- Compensates for the monitor's SDR brightness and saturation settings in the
-  capture conversion, avoiding applying that display adjustment twice.
-- Bypasses Hyprland's problematic HDR unmodified-copy MRT path, which caused
-  frozen capture/screenshots and incorrect blur with FP16 framebuffers.
-- Keeps normal behavior for monitors outside HDR mode.
+The conversion uses the monitor's `sdr_min_luminance` and `sdr_max_luminance`,
+compensates for display brightness and saturation adjustments already present in
+compositor textures, and preserves premultiplied alpha. SDR textures and isolated
+SDR scenes retain normal Hyprland rendering.
 
-This is HDR-to-SDR capture correction: it does not turn an SDR OBS recording
-into an HDR recording. OBS's recording color space and encoder remain its own
-settings.
+Hyprland controls when unmodified copies are created. The plugin does not override
+that setting, replace the mirror-copy function, implement its own blur passes or
+change buffer imports. These captures remain SDR; OBS's recording color space and
+encoder are configured separately.
 
-### Corrects alpha blending and transparent surfaces in HDR
+## Alpha blending
 
-- Corrects the effective opacity of translucent windows and fading surfaces,
-  including window alpha, fade alpha, surface alpha modifiers and overall
-  opacity.
-- Corrects per-pixel alpha for eligible RGBA textures, in addition to scalar
-  window opacity. Fully transparent and fully opaque endpoints are preserved.
-- Applies shader and opacity adjustments only for the affected draw, restoring
-  temporary state afterwards instead of rewriting the client's surface state.
-
-The HDR alpha correction is
-`1 - (1 - alpha)^1.5`. It is a targeted appearance correction, not a replacement
-for Hyprland's entire blending/color-management implementation.
-
-### Fixes blur behind transparent windows in HDR
-
-- Creates the SDR blur input from the HDR source with the monitor's luminance
-  mapping, then runs the configured blur passes and finish settings.
-- Temporarily supplies the SDR/sRGB color description when the blur texture is
-  drawn in HDR, avoiding a second incorrect HDR interpretation.
-- Retains ordinary blur handling when the HDR correction cannot be used.
-
-## Rendering and recording optimizations
-
-GPU transport and copying, scRGB-to-PQ conversion, single-pass fullscreen HDR rendering, capture pacing/VRR recording optimizations and stale VRR capability-cache correction have moved to [hyprland-gpu-switch](https://github.com/yayuuu/hyprland-gpu-switch). See that project's README for configuration, supported paths and limitations.
-
-This plugin contains only HDR color, alpha, blur and capture-color corrections. It does not launch a transfer worker, optimize fullscreen composition or change capture timing and VRR policy. The color corrections operate independently.
+The plugin retains the HDR opacity correction `1 - (1 - alpha)^1.5` for translucent
+surfaces and eligible RGBA textures. Temporary changes apply only to the affected
+monitor draw. Screensharing, mirrors and capture rendering keep the original
+scalar and per-pixel alpha. Fully transparent and opaque endpoints are preserved,
+and isolated SDR scenes are excluded.
 
 ## Build
 
-Install a C++23 compiler, Make, pkg-config and matching development packages for Hyprland, Aquamarine, Pixman, libdrm, Pango/Cairo, libinput, libudev, Wayland and libxkbcommon. The compositor headers must match the running binary.
+Install a C++23 compiler, Make, pkg-config and matching development packages for
+Hyprland and its dependencies. The compositor headers must match the running binary.
 
 ```sh
 make
 ```
 
-The shared object no longer embeds a Vulkan worker or requires shader compilation. Load `hyprland-fix-hdr.so` through the Hyprland configuration.
+Load `hyprland-fix-hdr.so` through the Hyprland configuration.
 
 ## Status
 
@@ -64,4 +45,6 @@ The shared object no longer embeds a Vulkan worker or requires shader compilatio
 hyprctl hdrfix status
 ```
 
-The status reports the installed color corrections. Rendering and recording optimization controls are provided by GPU-switch.
+The status reports the active corrections, SDR-copy and tonemapping draw counts,
+and shader failures. GPU transport, fullscreen rendering and recording optimizations
+are provided by [hyprland-gpu-switch](https://github.com/yayuuu/hyprland-gpu-switch).
