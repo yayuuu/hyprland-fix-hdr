@@ -59,7 +59,6 @@ static CFunctionHook* g_blurFramebufferHook      = nullptr;
 static CFunctionHook* g_renderTextureHook        = nullptr;
 static CFunctionHook* g_preDrawSurfaceHook       = nullptr;
 static CFunctionHook* g_getShaderVariantHook     = nullptr;
-static CFunctionHook* g_ensureVRRHook            = nullptr;
 static bool           g_disableUnmodifiedCopyMRT = true;
 static SP<CShader>     g_captureShader;
 static std::unordered_set<uintptr_t> g_scalarAlphaCorrectionTextures;
@@ -121,7 +120,6 @@ typedef SP<Render::ITexture> (*origBlurFramebuffer)(void*, SP<Render::IFramebuff
 typedef void (*origRenderTextureInternal)(void*, SP<Render::ITexture>, const CBox&, const Render::GL::CHyprOpenGLImpl::STextureRenderData&);
 typedef void (*origPreDrawSurface)(void*, WP<CSurfacePassElement>, const CRegion&);
 typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, Render::ShaderFeatureFlags);
-typedef void (*origEnsureVRR)(void*, PHLMONITOR);
 
 static constexpr float HDR_ALPHA_CORRECTION_EXPONENT      = 1.5F;
 
@@ -148,85 +146,6 @@ static bool hkNeedsUnmodifiedCopy(void* thisptr) {
         return false;
 
     return ((origNeedsUnmodifiedCopy)g_needsUnmodifiedCopyHook->m_original)(thisptr);
-}
-
-static bool drmPropValue(const int fd, const uint32_t obj, const uint32_t type, const uint32_t prop, uint64_t& value) {
-    if (fd < 0 || obj == 0 || prop == 0)
-        return false;
-
-    const auto props = drmModeObjectGetProperties(fd, obj, type);
-    if (!props)
-        return false;
-
-    bool found = false;
-    for (uint32_t i = 0; i < props->count_props; ++i) {
-        if (props->props[i] != prop)
-            continue;
-
-        value = props->prop_values[i];
-        found = true;
-        break;
-    }
-
-    drmModeFreeObjectProperties(props);
-    return found;
-}
-
-static bool connectorHasVrrSupport(Aquamarine::SDRMConnector* connector) {
-    if (!connector || !connector->crtc || !connector->backend)
-        return false;
-
-    if (!connector->props.values.vrr_capable || !connector->crtc->props.values.vrr_enabled)
-        return false;
-
-    uint64_t capable = 0;
-    if (!drmPropValue(connector->backend->drmFD(), connector->id, DRM_MODE_OBJECT_CONNECTOR, connector->props.values.vrr_capable, capable))
-        return false;
-
-    return capable != 0;
-}
-
-static void correctVrrCapabilityCache(Aquamarine::SDRMConnector* connector) {
-    if (!connector || connector->canDoVrr || !connectorHasVrrSupport(connector))
-        return;
-
-    connector->canDoVrr = true;
-    if (connector->output)
-        connector->output->vrrCapable = true;
-
-    if (connector->backend)
-        connector->backend->log(Aquamarine::AQ_LOG_DEBUG, std::format("[hyprland-fix-hdr:capture] corrected stale VRR capability cache for {}", connector->szName));
-}
-
-static void correctMonitorVrrCapabilityCache(PHLMONITOR monitor) {
-    if (!monitor || !monitor->m_output)
-        return;
-
-    const auto drmOutput = dynamic_cast<Aquamarine::CDRMOutput*>(monitor->m_output.get());
-    if (!drmOutput || !drmOutput->connector)
-        return;
-
-    correctVrrCapabilityCache(drmOutput->connector.get());
-}
-
-static void correctAllMonitorVrrCapabilityCaches() {
-    if (!g_pCompositor)
-        return;
-
-    if (!State::monitorState())
-        return;
-
-    for (const auto& monitor : State::monitorState()->monitors())
-        correctMonitorVrrCapabilityCache(monitor);
-}
-
-static void hkEnsureVRR(void* thisptr, PHLMONITOR monitor) {
-    if (monitor)
-        correctMonitorVrrCapabilityCache(monitor);
-    else
-        correctAllMonitorVrrCapabilityCaches();
-
-    ((origEnsureVRR)g_ensureVRRHook->m_original)(thisptr, monitor);
 }
 
 static bool canImportDMABUFForRenderbuffer(const SP<Aquamarine::IBuffer>& buffer) {
@@ -875,14 +794,6 @@ void HDRFix::initScreenshare(HANDLE handle) {
     if (!g_preDrawSurfaceHook || !g_preDrawSurfaceHook->hook())
         throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook Render::IElementRenderer::preDrawSurface");
 
-    g_ensureVRRHook = HyprlandAPI::createFunctionHook(
-        g_pluginHandle,
-        findFnOrThrow("ensureVRR", {"Config::CMonitorRuleManager::ensureVRR("}),
-        (void*)hkEnsureVRR);
-
-    if (!g_ensureVRRHook || !g_ensureVRRHook->hook())
-        throw std::runtime_error("[hyprland-fix-hdr:capture] Failed to hook Config::CMonitorRuleManager::ensureVRR");
-
     scheduleRefreshForAllMonitors();
 
 
@@ -933,11 +844,7 @@ void HDRFix::exitScreenshare() {
         g_getShaderVariantHook = nullptr;
     }
 
-    if (g_ensureVRRHook) {
-        g_ensureVRRHook->unhook();
-        HyprlandAPI::removeFunctionHook(g_pluginHandle, g_ensureVRRHook);
-        g_ensureVRRHook = nullptr;
-    }
+
 
     g_importableDMABUFs.clear();
     g_srgbBlurTextures.clear();

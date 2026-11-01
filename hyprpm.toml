@@ -6,7 +6,7 @@ authors = ["daniel"]
 plugins = ["hyprland-fix-hdr"]
 
 [hyprland-fix-hdr]
-description = "HDR capture/color fixes, cross-GPU HDR transfers and capture/VRR synchronization"
+description = "HDR color, alpha, blur and capture-color corrections"
 authors = ["daniel"]
 output = "hyprland-fix-hdr.so"
 build = ["make"]

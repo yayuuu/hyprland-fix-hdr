@@ -2,9 +2,7 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
 namespace HDRFix {
-    inline constexpr const char* VERSION = "0.6.0";
+    inline constexpr const char* VERSION = "0.7.0";
     void initScreenshare(HANDLE handle);
     void exitScreenshare();
-    void initOffload(HANDLE handle);
-    void exitOffload();
 }

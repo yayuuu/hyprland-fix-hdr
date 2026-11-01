@@ -1,7 +1,7 @@
 # hyprland-fix-hdr
 
 HDR rendering, color, blur and screen-capture corrections for stock Hyprland.
-Version **0.6.0** targets Hyprland **0.56.2** (`efb50993780079460b0cbed1363e2166a2de1d9f`) and Aquamarine **0.15.x**.
+Version **0.7.0** targets Hyprland **0.56.2** (`efb50993780079460b0cbed1363e2166a2de1d9f`) and Aquamarine **0.15.x**.
 
 ## What it does
 
@@ -43,15 +43,11 @@ for Hyprland's entire blending/color-management implementation.
   drawn in HDR, avoiding a second incorrect HDR interpretation.
 - Retains ordinary blur handling when the HDR correction cannot be used.
 
-### Fullscreen rendering and capture cadence
+## Rendering and recording optimizations
 
-Eligible opaque fullscreen HDR surfaces can use the existing single-pass rendering path. Capture pacing coalesces requests with genuine content updates while retaining a deadline for stopped clients. Unsupported scenes retain normal rendering.
+GPU transport and copying, scRGB-to-PQ conversion, single-pass fullscreen HDR rendering, capture pacing/VRR recording optimizations and stale VRR capability-cache correction have moved to [hyprland-gpu-switch](https://github.com/yayuuu/hyprland-gpu-switch). See that project's README for configuration, supported paths and limitations.
 
-### Cross-GPU copying
-
-Cross-GPU copying optimizations, the Vulkan transfer worker and scRGB-to-PQ transport conversion have moved to [hyprland-gpu-switch](https://github.com/yayuuu/hyprland-gpu-switch). That plugin handles both SDR and HDR transfers, including configurations that do not require automatic renderer switching. See its README for supported formats, synchronization, requirements and limitations.
-
-This plugin no longer implements or launches the transfer worker. Its single-pass rendering path can use the optional transport service provided by hyprland-gpu-switch; without it, ordinary drawing remains available. HDR color, alpha, blur and capture corrections remain here and work independently.
+This plugin contains only HDR color, alpha, blur and capture-color corrections. It does not launch a transfer worker, optimize fullscreen composition or change capture timing and VRR policy. The color corrections operate independently.
 
 ## Build
 
@@ -63,12 +59,10 @@ make
 
 The shared object no longer embeds a Vulkan worker or requires shader compilation. Load `hyprland-fix-hdr.so` through the Hyprland configuration.
 
-## Controls
+## Status
 
 ```sh
 hyprctl hdrfix status
-hyprctl hdrfix on
-hyprctl hdrfix off
 ```
 
-`on` and `off` control the fullscreen optimization. Color/capture corrections remain installed. Transport policy and counters belong to its provider; the old offload and worker controls were removed.
+The status reports the loaded version and installed color corrections. Rendering and recording optimization controls are provided by GPU-switch.
