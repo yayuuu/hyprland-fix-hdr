@@ -49,6 +49,9 @@ Hyprland and its dependencies. The compositor headers must match the running bin
 make
 ```
 
+Every invocation recompiles against the headers selected by `pkg-config`, including
+after Hyprland or dependency updates. The build does not check for a specific release.
+
 Load `hyprland-fix-hdr.so` through the Hyprland configuration.
 
 ## Status
